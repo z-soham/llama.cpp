@@ -1,7 +1,7 @@
 // Guards the phone model picker: the dropdown serves a phone a bottom drawer
 // with the same search and sections the desktop menu shows.
 
-import ModelsSelectorDropdown from '$lib/components/app/models/ModelsSelector/ModelsSelectorDropdown.svelte';
+import ModelsSelectorDropdownWrapper from './components/ModelsSelectorDropdownWrapper.svelte';
 import { ServerRole } from '$lib/enums';
 import { ModelsService } from '$lib/services/models.service';
 import { modelsStore } from '$lib/stores/models/index.svelte';
@@ -34,18 +34,19 @@ describe('model picker drawer on a phone', () => {
 		vi.spyOn(ModelsService, 'list').mockResolvedValue({
 			data: [{ id: option.model }, { id: other.model }]
 		} as never);
-		modelsStore.models = [option, other];
+		// the models read through the providers data layer on this layer of the stack
+		modelsStore.activeModels = [option, other];
 		await page.viewport(PHONE.width, PHONE.height);
 	});
 
 	afterEach(async () => {
-		modelsStore.models = [];
+		modelsStore.activeModels = [];
 		vi.restoreAllMocks();
 		await page.viewport(DESKTOP.width, DESKTOP.height);
 	});
 
 	it('opens the picker in a drawer', async () => {
-		const screen = render(ModelsSelectorDropdown, { currentModel: option.model });
+		const screen = render(ModelsSelectorDropdownWrapper, { currentModel: option.model });
 
 		await screen.getByRole('button').click();
 
