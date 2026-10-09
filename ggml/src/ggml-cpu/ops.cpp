@@ -1993,8 +1993,12 @@ static void ggml_compute_forward_concat_elem(
               char * y  = (      char *) dst->data  + i1*nb1 + i2*nb2 + i3*nb3;
 
         if (contig) {
-            memcpy(y, x0, n0*es);
-            memcpy(y + n0*es, x1, (ne0 - n0)*es);
+            if (n0 > 0) {
+                memcpy(y, x0, n0*es);
+            }
+            if (ne0 > n0) {
+                memcpy(y + n0*es, x1, (ne0 - n0)*es);
+            }
         } else {
             for (int64_t i0 = 0; i0 < ne0; ++i0) {
                 if (i0 < n0) {
