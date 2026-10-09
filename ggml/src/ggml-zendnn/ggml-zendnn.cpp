@@ -722,21 +722,6 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
                 if(K <= 256 || N <= 128 || M <= 96) {
                     return false;
                 }
-
-                // MUL_MAT_ID's gather+matmul+scatter approach favors a moderate expert count
-                if (op->op == GGML_OP_MUL_MAT_ID) {
-                    const int64_t n_experts = weights->ne[2];
-                    const int64_t max_experts = 32;
-                    if (n_experts > max_experts) {
-                        return false;
-                    }
-
-                    // fall back once the average rows per expert (N / n_experts) is too thin
-                    // to amortize each per-expert GEMM's overhead
-                    if (N / n_experts <= 32) {
-                        return false;
-                    }
-                }
             }
             else if (ne0 < min_batch || ne1 < min_batch || ne10 < min_batch) {
                 return false;
