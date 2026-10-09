@@ -1948,14 +1948,17 @@ static void ggml_compute_forward_concat_any(
     }
 }
 
-static void ggml_compute_forward_concat_i8(
+// concat for types with a 1/2/4 byte element: work is split over all dst rows (not just ne2, which is 1 for a
+// single sequence) and each row is copied with at most two memcpy calls
+static void ggml_compute_forward_concat_elem(
     const ggml_compute_params * params,
-    ggml_tensor * dst) {
+    ggml_tensor * dst,
+    const size_t es) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(int8_t));
+    GGML_ASSERT(ggml_type_size(src0->type) == es);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -1969,112 +1972,51 @@ static void ggml_compute_forward_concat_i8(
     int64_t o[4] = {0, 0, 0, 0};
     o[dim] = src0->ne[dim];
 
-    const int8_t * x;
+    const bool contig = nb00 == es && nb10 == es && nb0 == es;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const int8_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const int8_t *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
+    const int64_t nr  = ne1*ne2*ne3;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
 
-                    int8_t * y = (int8_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = ir - i3*ne2*ne1 - i2*ne1;
 
-                    *y = *x;
+        // elements [0, n0) of the row come from src0, the rest from src1
+        const bool    in0 = i1 < ne01 && i2 < ne02 && i3 < ne03;
+        const int64_t n0  = in0 ? ne00 : 0;
+
+        const char * x0 = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+        const char * x1 = (const char *) src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
+              char * y  = (      char *) dst->data  + i1*nb1 + i2*nb2 + i3*nb3;
+
+        if (contig) {
+            memcpy(y, x0, n0*es);
+            memcpy(y + n0*es, x1, (ne0 - n0)*es);
+        } else {
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                if (i0 < n0) {
+                    memcpy(y + i0*nb0, x0 + i0*nb00, es);
+                } else {
+                    memcpy(y + i0*nb0, x1 + (i0 - n0)*nb10, es);
                 }
             }
         }
     }
 }
 
-static void ggml_compute_forward_concat_f16(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(ggml_fp16_t));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const ggml_fp16_t * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const ggml_fp16_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const ggml_fp16_t *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
-
-                    ggml_fp16_t * y = (ggml_fp16_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
-            }
-        }
-    }
+static void ggml_compute_forward_concat_i8(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_concat_elem(params, dst, sizeof(int8_t));
 }
 
-static void ggml_compute_forward_concat_f32(
-    const ggml_compute_params * params,
-    ggml_tensor * dst) {
+static void ggml_compute_forward_concat_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_concat_elem(params, dst, sizeof(ggml_fp16_t));
+}
 
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(float));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int32_t dim = ggml_get_op_params_i32(dst, 0);
-
-    GGML_ASSERT(dim >= 0 && dim < 4);
-
-    int64_t o[4] = {0, 0, 0, 0};
-    o[dim] = src0->ne[dim];
-
-    const float * x;
-
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
-                    } else {
-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
-                    }
-
-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
-
-                    *y = *x;
-                }
-            }
-        }
-    }
+static void ggml_compute_forward_concat_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_concat_elem(params, dst, sizeof(float));
 }
 
 void ggml_compute_forward_concat(
