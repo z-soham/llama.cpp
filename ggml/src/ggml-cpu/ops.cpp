@@ -1948,6 +1948,60 @@ static void ggml_compute_forward_concat_any(
     }
 }
 
+// dim 0 concat where src1 is a transposed view (unit stride along dim 1, so dst rows i1..i1+R-1 read adjacent elements):
+// copy blocks of R rows through small tiles instead of one strided element at a time
+template <typename T>
+static void ggml_compute_forward_concat_dim0_transposed(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    constexpr int64_t R  = 16;  // dst rows per block
+    constexpr int64_t TI = 64;  // src1 elements along dim 0 per tile
+
+    const int64_t nr  = ne1*ne2*ne3;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = ir - i3*ne2*ne1 - i2*ne1;
+
+        const int64_t nrb = MIN(R, MIN(ir1 - ir, ne1 - i1));
+
+        char *       y  = (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3;
+        const char * x0 = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+        const char * x1 = (const char *) src1->data + i1*nb11 + i2*nb12 + i3*nb13;
+
+        if (ne00 > 0) {
+            for (int64_t r = 0; r < nrb; ++r) {
+                memcpy(y + r*nb1, x0 + r*nb01, ne00*sizeof(T));
+            }
+        }
+
+        for (int64_t j0 = 0; j0 < ne10; j0 += TI) {
+            const int64_t nj = MIN(TI, ne10 - j0);
+            for (int64_t j = 0; j < nj; ++j) {
+                const T * p = (const T *) (x1 + (j0 + j)*nb10);
+                for (int64_t r = 0; r < nrb; ++r) {
+                    ((T *) (y + r*nb1))[ne00 + j0 + j] = p[r];
+                }
+            }
+        }
+
+        ir += nrb;
+    }
+}
+
 // concat for types with a 1/2/4 byte element: work is split over all dst rows (not just ne2, which is 1 for a
 // single sequence) and each row is copied with at most two memcpy calls
 static void ggml_compute_forward_concat_elem(
@@ -1973,6 +2027,15 @@ static void ggml_compute_forward_concat_elem(
     o[dim] = src0->ne[dim];
 
     const bool contig = nb00 == es && nb10 == es && nb0 == es;
+
+    if (!contig && dim == 0 && nb00 == es && nb0 == es && nb10 != es && nb11 == es) {
+        switch (es) {
+            case 1: ggml_compute_forward_concat_dim0_transposed<uint8_t >(params, dst); return;
+            case 2: ggml_compute_forward_concat_dim0_transposed<uint16_t>(params, dst); return;
+            case 4: ggml_compute_forward_concat_dim0_transposed<uint32_t>(params, dst); return;
+            default: break;
+        }
+    }
 
     const int64_t nr  = ne1*ne2*ne3;
     const int64_t dr  = (nr + nth - 1)/nth;
