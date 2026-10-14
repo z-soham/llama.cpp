@@ -9,12 +9,51 @@
 #include "zendnnl.hpp"
 
 #include <cstring>
+#include <vector>
 
+
+struct mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
+
+// per-call vectors of the MoE path, kept in the context so their storage is reused (grow-only)
+struct ggml_zendnn_moe_scratch {
+    // group_matmul arguments
+    std::vector<char>         layout;
+    std::vector<bool>         trans_a;
+    std::vector<bool>         trans_b;
+    std::vector<int>          batch_m;
+    std::vector<int>          batch_n;
+    std::vector<int>          batch_k;
+    std::vector<float>        alpha;
+    std::vector<float>        beta;
+    std::vector<const void *> bias;
+    std::vector<int>          lda_v;
+    std::vector<int>          ldb_v;
+    std::vector<int>          ldc_v;
+    std::vector<bool>         is_wei_const;
+    std::vector<zendnnl::lowoha::matmul::matmul_params> params;
+
+    // row grouping and per-expert batches of mul_mat_id
+    std::vector<int64_t>         matrix_row_counts;
+    std::vector<int64_t>         matrix_row_start;
+    std::vector<int64_t>         matrix_row_fill;
+    std::vector<mmid_row_mapping> matrix_rows;
+    std::vector<int64_t>         expert_row_count;
+    std::vector<const void *>    batch_src;
+    std::vector<const void *>    batch_wei;
+    std::vector<void *>          batch_dst;
+    std::vector<int64_t>         expert_wdata_off;
+    std::vector<int64_t>         expert_dst_off;
+    std::vector<int>             expert_batch_idx;
+};
 
 struct ggml_backend_zendnn_context {
     int n_threads = GGML_DEFAULT_N_THREADS;
     std::unique_ptr<char[]> work_data;
     size_t work_size = 0;
+    ggml_zendnn_moe_scratch moe;
 };
 
 template<typename T>
@@ -231,11 +270,6 @@ static void ggml_zendnn_compute_forward_mul_mat(
     }
 }
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 /**
  * ZenDNN batched matmul: computes C[i] = B[i] * A[i] for every active expert i via a single
  * group_matmul_direct() call. Batched analogue of ggml_zendnn_matmul() - see its docs for the
@@ -253,34 +287,35 @@ static bool ggml_zendnn_group_matmul(ggml_backend_zendnn_context * ctx, int64_t 
 
     zendnnl::lowoha::matmul::matmul_params base_params = ggml_zendnn_make_matmul_params<TA, TB, TC>(ctx);
 
-    std::vector<char>         layout(n_experts, 'r');
-    std::vector<bool>         trans_a(n_experts, false);
-    std::vector<bool>         trans_b(n_experts, true);
-    std::vector<int>          batch_m(n_experts);
-    std::vector<int>          batch_n(n_experts, m);
-    std::vector<int>          batch_k(n_experts, k);
-    std::vector<float>        alpha(n_experts, 1.0f);
-    std::vector<float>        beta(n_experts, 0.0f);
-    std::vector<const void *> bias(n_experts, nullptr);
-    std::vector<int>          lda_v(n_experts, lda);
-    std::vector<int>          ldb_v(n_experts, ldb);
-    std::vector<int>          ldc_v(n_experts, ldc);
-    std::vector<bool>         is_wei_const(n_experts, true);
-    std::vector<zendnnl::lowoha::matmul::matmul_params> params(n_experts, base_params);
+    ggml_zendnn_moe_scratch & sc = ctx->moe;
+    sc.layout.assign(n_experts, 'r');
+    sc.trans_a.assign(n_experts, false);
+    sc.trans_b.assign(n_experts, true);
+    sc.batch_m.resize(n_experts);
+    sc.batch_n.assign(n_experts, m);
+    sc.batch_k.assign(n_experts, k);
+    sc.alpha.assign(n_experts, 1.0f);
+    sc.beta.assign(n_experts, 0.0f);
+    sc.bias.assign(n_experts, nullptr);
+    sc.lda_v.assign(n_experts, lda);
+    sc.ldb_v.assign(n_experts, ldb);
+    sc.ldc_v.assign(n_experts, ldc);
+    sc.is_wei_const.assign(n_experts, true);
+    sc.params.assign(n_experts, base_params);
 
     for (int i = 0; i < n_experts; i++) {
-        batch_m[i] = n[i];
+        sc.batch_m[i] = n[i];
 
         // src_scale.dims depends on this expert's row count, unlike the rest of base_params
         if constexpr (std::is_same_v<TA, block_q8_0>) {
-            params[i].quant_params.src_scale.dims = {n[i], k / QK8_0};
+            sc.params[i].quant_params.src_scale.dims = {n[i], k / QK8_0};
         }
     }
 
     zendnnl::error_handling::status_t status = zendnnl::lowoha::matmul::group_matmul_direct(
-        layout, trans_a, trans_b, batch_m, batch_n, batch_k, alpha,
-        B, ldb_v, A, lda_v, bias, beta,
-        C, ldc_v, is_wei_const, params);
+        sc.layout, sc.trans_a, sc.trans_b, sc.batch_m, sc.batch_n, sc.batch_k, sc.alpha,
+        B, sc.ldb_v, A, sc.lda_v, sc.bias, sc.beta,
+        C, sc.ldc_v, sc.is_wei_const, sc.params);
 
     if (status != zendnnl::error_handling::status_t::success) {
         GGML_LOG_ERROR("%s, ZenDNN group matmul failed: status=%d\n", __func__, static_cast<int>(status));
@@ -365,12 +400,15 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_experts
 
-    std::vector<int64_t> matrix_row_counts(n_as, 0);
-    std::vector<std::vector<mmid_row_mapping>> matrix_rows(n_as);
+    ggml_zendnn_moe_scratch & sc = ctx->moe;
+    sc.matrix_row_counts.assign(n_as, 0);
+    sc.matrix_row_start.resize(n_as + 1);
+    sc.matrix_row_fill.assign(n_as, 0);
+    std::vector<int64_t> & matrix_row_counts = sc.matrix_row_counts;
 
     int64_t total_rows = 0;
     int     n_active_experts = 0;
-    // group rows by expert (preprocessing step)
+    // group rows by expert (preprocessing step): count, prefix sum, then fill in (token, slot) order
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
         for (int id = 0; id < n_ids; ++id) {
             const int32_t i02 = *(const int32_t *)((const char *)ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -380,11 +418,23 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
             if (matrix_row_counts[i02] == 0) {
                 n_active_experts++;
             }
-            matrix_rows[i02].push_back({id, iid1});
             matrix_row_counts[i02]++;
             total_rows++;
         }
     }
+
+    sc.matrix_row_start[0] = 0;
+    for (int64_t cur_a = 0; cur_a < n_as; ++cur_a) {
+        sc.matrix_row_start[cur_a + 1] = sc.matrix_row_start[cur_a] + matrix_row_counts[cur_a];
+    }
+    sc.matrix_rows.resize(total_rows);
+    for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *)((const char *)ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+            sc.matrix_rows[sc.matrix_row_start[i02] + sc.matrix_row_fill[i02]++] = {id, (int32_t) iid1};
+        }
+    }
+    const mmid_row_mapping * matrix_rows = sc.matrix_rows.data();
 
     if (total_rows == 0) {
         return; // no rows to process
@@ -417,15 +467,22 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
     char * dst_cur = wdata_cur + wdata_cur_size;
 
     // per-expert data collected during gather, handed to ggml_zendnn_group_gemm() as one batch
-    std::vector<int64_t>      expert_row_count(n_active_experts);
-    std::vector<const void *> batch_src(n_active_experts);
-    std::vector<const void *> batch_wei(n_active_experts);
-    std::vector<void *>       batch_dst(n_active_experts);
+    sc.expert_row_count.resize(n_active_experts);
+    sc.batch_src.resize(n_active_experts);
+    sc.batch_wei.resize(n_active_experts);
+    sc.batch_dst.resize(n_active_experts);
+    std::vector<int64_t> &      expert_row_count = sc.expert_row_count;
+    std::vector<const void *> & batch_src        = sc.batch_src;
+    std::vector<const void *> & batch_wei        = sc.batch_wei;
+    std::vector<void *> &       batch_dst        = sc.batch_dst;
 
     // precompute per-expert buffer offsets and batch indices for the parallel loop below
-    std::vector<int64_t> expert_wdata_off(n_as, 0);
-    std::vector<int64_t> expert_dst_off(n_as, 0);
-    std::vector<int>     expert_batch_idx(n_as, -1);
+    sc.expert_wdata_off.assign(n_as, 0);
+    sc.expert_dst_off.assign(n_as, 0);
+    sc.expert_batch_idx.assign(n_as, -1);
+    std::vector<int64_t> & expert_wdata_off = sc.expert_wdata_off;
+    std::vector<int64_t> & expert_dst_off   = sc.expert_dst_off;
+    std::vector<int> &     expert_batch_idx = sc.expert_batch_idx;
     {
         int64_t w_off = 0;
         int64_t d_off = 0;
@@ -457,7 +514,7 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
         const int     batch_idx = expert_batch_idx[cur_a];
 
         for (int64_t ir1 = 0; ir1 < cne1; ++ir1) {
-            const mmid_row_mapping & row_mapping = matrix_rows[cur_a][ir1];
+            const mmid_row_mapping & row_mapping = matrix_rows[sc.matrix_row_start[cur_a] + ir1];
             const int64_t id  = row_mapping.i1;
             const int64_t i11 = id % ne11;
             const int64_t i12 = row_mapping.i2;
@@ -504,7 +561,7 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
         const int64_t d_off = expert_dst_off[cur_a];
 
         for (int64_t ir1 = 0; ir1 < cne1; ++ir1) {
-            const mmid_row_mapping & row_mapping = matrix_rows[cur_a][ir1];
+            const mmid_row_mapping & row_mapping = matrix_rows[sc.matrix_row_start[cur_a] + ir1];
             const int64_t id = row_mapping.i1;
             const int64_t i1 = id;
             const int64_t i2 = row_mapping.i2;
