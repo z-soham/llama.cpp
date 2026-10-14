@@ -11265,6 +11265,67 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 }
 
 // ggml_compute_forward_gated_delta_net
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+// One token of the gated delta rule for one (head, sequence) with S_v = 16*NV, in a single pass over the state rows:
+// each row j of the transposed state is loaded once, decayed, dotted with k, updated with the rank-1 term, dotted with q
+// and stored. The state is held transposed: row j = column j of S.
+template <int NV, bool KDA>
+static inline void ggml_gated_delta_net_token_avx512(
+        float * s, const int64_t S_v, const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float beta, const float scale, float * attn) {
+    __m512 kv[NV];
+    __m512 qv[NV];
+    for (int i = 0; i < NV; ++i) {
+        kv[i] = _mm512_loadu_ps(k_d + 16*i);
+        qv[i] = _mm512_loadu_ps(q_d + 16*i);
+    }
+
+    __m512 dec[KDA ? NV : 1];
+    __m512 av = _mm512_setzero_ps();
+    float  a  = 1.0f;
+    if constexpr (KDA) {
+        for (int i = 0; i < NV; ++i) {
+            dec[i] = ggml_v_expf(_mm512_loadu_ps(g_d + 16*i));
+        }
+    } else {
+        a  = expf(g_d[0]);
+        av = _mm512_set1_ps(a);
+    }
+
+    for (int64_t j = 0; j < S_v; ++j) {
+        float * row = s + j*S_v;
+
+        __m512 r[NV];
+        __m512 acc[2] = { _mm512_setzero_ps(), _mm512_setzero_ps() };
+        for (int i = 0; i < NV; ++i) {
+            r[i] = _mm512_loadu_ps(row + 16*i);
+            if constexpr (KDA) {
+                r[i] = _mm512_mul_ps(r[i], dec[i]);
+            }
+            acc[i & 1] = _mm512_fmadd_ps(r[i], kv[i], acc[i & 1]);
+        }
+        float sum = _mm512_reduce_add_ps(_mm512_add_ps(acc[0], acc[1]));
+        if constexpr (!KDA) {
+            sum *= a;
+        }
+
+        const __m512 dv = _mm512_set1_ps((v_d[j] - sum) * beta);
+
+        __m512 qacc[2] = { _mm512_setzero_ps(), _mm512_setzero_ps() };
+        for (int i = 0; i < NV; ++i) {
+            if constexpr (!KDA) {
+                r[i] = _mm512_mul_ps(r[i], av);
+            }
+            r[i] = _mm512_fmadd_ps(kv[i], dv, r[i]);
+            _mm512_storeu_ps(row + 16*i, r[i]);
+            qacc[i & 1] = _mm512_fmadd_ps(r[i], qv[i], qacc[i & 1]);
+        }
+        attn[j] = _mm512_reduce_add_ps(_mm512_add_ps(qacc[0], qacc[1])) * scale;
+    }
+}
+#endif
+
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
@@ -11372,36 +11433,58 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
 
-            if (kda) {
-                // precompute exp(g) into delta scratch (reused below)
-                for (int64_t i = 0; i < S_v; ++i) {
-                    delta[i] = expf(g_d[i]);
+            bool fast = false;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+            if (S_v == 128 || S_v == 64) {
+                if (S_v == 128) {
+                    if (kda) {
+                        ggml_gated_delta_net_token_avx512<8, true >(s_out, S_v, q_d, k_d, v_d, g_d, beta_val, scale, attn_data);
+                    } else {
+                        ggml_gated_delta_net_token_avx512<8, false>(s_out, S_v, q_d, k_d, v_d, g_d, beta_val, scale, attn_data);
+                    }
+                } else {
+                    if (kda) {
+                        ggml_gated_delta_net_token_avx512<4, true >(s_out, S_v, q_d, k_d, v_d, g_d, beta_val, scale, attn_data);
+                    } else {
+                        ggml_gated_delta_net_token_avx512<4, false>(s_out, S_v, q_d, k_d, v_d, g_d, beta_val, scale, attn_data);
+                    }
                 }
-                // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+                fast = true;
+            }
+#endif
+
+            if (!fast) {
+                if (kda) {
+                    // precompute exp(g) into delta scratch (reused below)
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        delta[i] = expf(g_d[i]);
+                    }
+                    // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    }
+                } else {
+                    ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                }
+
+                // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
                 for (int64_t j = 0; j < S_v; ++j) {
-                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                    delta[j] = (v_d[j] - sum) * beta_val;
                 }
-            } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
-            }
 
-            // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = 0; j < S_v; ++j) {
-                float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
-                delta[j] = (v_d[j] - sum) * beta_val;
-            }
+                // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+                }
 
-            // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
-                ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
-            }
-
-            // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = 0; j < S_v; ++j) {
-                float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
-                attn_data[j] = sum * scale;
+                // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
+                    attn_data[j] = sum * scale;
+                }
             }
 
             attn_data += S_v * H; // advance to next token
