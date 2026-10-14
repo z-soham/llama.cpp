@@ -9937,11 +9937,44 @@ void ggml_compute_forward_flash_attn_back(
 
 // ggml_compute_forward_ssm_conv
 
-static void ggml_compute_forward_ssm_conv_f32(
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+// 16x16 transpose of f32 values held in 16 zmm registers
+static inline void ggml_transpose16x16_ps(__m512 r[16]) {
+    __m512 t[16];
+    for (int i = 0; i < 8; ++i) {
+        t[2*i]     = _mm512_unpacklo_ps(r[2*i], r[2*i + 1]);
+        t[2*i + 1] = _mm512_unpackhi_ps(r[2*i], r[2*i + 1]);
+    }
+    __m512 u[16];
+    for (int i = 0; i < 4; ++i) {
+        u[4*i + 0] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[4*i]),     _mm512_castps_pd(t[4*i + 2])));
+        u[4*i + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[4*i]),     _mm512_castps_pd(t[4*i + 2])));
+        u[4*i + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[4*i + 1]), _mm512_castps_pd(t[4*i + 3])));
+        u[4*i + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[4*i + 1]), _mm512_castps_pd(t[4*i + 3])));
+    }
+    for (int j = 0; j < 4; ++j) {
+        const __m512 p0 = _mm512_shuffle_f32x4(u[j],     u[4 + j],  0x88);
+        const __m512 p1 = _mm512_shuffle_f32x4(u[8 + j], u[12 + j], 0x88);
+        const __m512 p2 = _mm512_shuffle_f32x4(u[j],     u[4 + j],  0xDD);
+        const __m512 p3 = _mm512_shuffle_f32x4(u[8 + j], u[12 + j], 0xDD);
+        r[0*4 + j] = _mm512_shuffle_f32x4(p0, p1, 0x88);
+        r[1*4 + j] = _mm512_shuffle_f32x4(p2, p3, 0x88);
+        r[2*4 + j] = _mm512_shuffle_f32x4(p0, p1, 0xDD);
+        r[3*4 + j] = _mm512_shuffle_f32x4(p2, p3, 0xDD);
+    }
+}
+#endif
+
+// ssm_conv on f32; if silu is set the SiLU is applied to every output element (fused SSM_CONV + SILU) and the result is
+// written to out (the SILU node) instead of dst. Elements are silu'd as ggml_vec_silu_f32 does on rows of dst (groups of 16
+// channels from channel 0, scalar tail), so the result is bit-identical to the separate SILU op.
+static void ggml_compute_forward_ssm_conv_f32_impl(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // conv_x
-    const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+        const ggml_tensor * src0,   // conv_x
+        const ggml_tensor * src1,   // conv1d.weight
+        ggml_tensor * out,
+        bool silu) {
+    const ggml_tensor * dst = out;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -9956,6 +9989,78 @@ static void ggml_compute_forward_ssm_conv_f32(
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
     GGML_ASSERT(src0->nb[1] == src0->ne[0]*sizeof(float));
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    if (src1->nb[1] == (size_t) nc*sizeof(float) && dst->nb[0] == sizeof(float) && n_t >= 16 && nr >= 16) {
+        // blocks of 16 channels are split over threads; per block, 16 tokens at a time: vectors run along tokens (contiguous
+        // in src0), the 16x16 tile is transposed so the output rows (channels contiguous) are written as full vectors
+        const int nb  = nr/16;
+        const int db  = (nb + nth - 1)/nth;
+        const int ib0 = db*ith;
+        const int ib1 = MIN(ib0 + db, nb);
+        const int nt16 = n_t - n_t%16;
+
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            for (int ib = ib0; ib < ib1; ++ib) {
+                const int c0 = ib*16;
+                const float * s = (const float *) ((const char *) src0->data + c0*src0->nb[1] + i3*src0->nb[2]);
+                const float * w = (const float *) ((const char *) src1->data + c0*src1->nb[1]);
+                float * y = (float *) ((char *) dst->data + c0*dst->nb[0] + i3*dst->nb[2]);
+
+                for (int t0 = 0; t0 < nt16; t0 += 16) {
+                    __m512 v[16];
+                    for (int c = 0; c < 16; ++c) {
+                        const float * sp = s + c*ncs + t0;
+                        const float * wp = w + c*nc;
+                        __m512 acc = _mm512_mul_ps(_mm512_loadu_ps(sp), _mm512_set1_ps(wp[0]));
+                        for (int k = 1; k < nc; ++k) {
+                            acc = _mm512_fmadd_ps(_mm512_loadu_ps(sp + k), _mm512_set1_ps(wp[k]), acc);
+                        }
+                        v[c] = acc;
+                    }
+                    ggml_transpose16x16_ps(v);
+                    for (int t = 0; t < 16; ++t) {
+                        _mm512_storeu_ps(y + (size_t) (t0 + t)*dst->nb[1]/sizeof(float), silu ? ggml_v_silu(v[t]) : v[t]);
+                    }
+                }
+                // tail tokens
+                for (int t = nt16; t < n_t; ++t) {
+                    float * yt = y + (size_t) t*dst->nb[1]/sizeof(float);
+                    for (int c = 0; c < 16; ++c) {
+                        float sumf = 0.0f;
+                        for (int k = 0; k < nc; ++k) {
+                            sumf += s[k + t + c*ncs] * w[k + c*nc];
+                        }
+                        yt[c] = sumf;
+                    }
+                    if (silu) {
+                        _mm512_storeu_ps(yt, ggml_v_silu(_mm512_loadu_ps(yt)));
+                    }
+                }
+            }
+        }
+
+        // tail channels (nr % 16): the last thread handles them with the scalar loop
+        const int c_tail = nb*16;
+        if (ith == nth - 1 && c_tail < nr) {
+            for (int i3 = 0; i3 < n_s; ++i3) {
+                for (int t = 0; t < n_t; ++t) {
+                    const float * s = (const float *) ((const char *) src0->data + c_tail*src0->nb[1] + t*src0->nb[0] + i3*src0->nb[2]);
+                    const float * w = (const float *) ((const char *) src1->data + c_tail*src1->nb[1]);
+                    float * yt = (float *) ((char *) dst->data + c_tail*dst->nb[0] + t*dst->nb[1] + i3*dst->nb[2]);
+                    for (int c = 0; c < nr - c_tail; ++c) {
+                        float sumf = 0.0f;
+                        for (int k = 0; k < nc; ++k) {
+                            sumf += s[k + c*ncs] * w[k + c*nc];
+                        }
+                        yt[c] = silu ? ggml_silu_f32(sumf) : sumf;
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -9988,6 +10093,37 @@ static void ggml_compute_forward_ssm_conv_f32(
             }
         }
     }
+
+    GGML_ASSERT(!silu); // fusion is only allowed where ggml_ssm_conv_silu_fusable() holds
+}
+
+static void ggml_compute_forward_ssm_conv_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_ssm_conv_f32_impl(params, dst->src[0], dst->src[1], dst, false);
+}
+
+// SSM_CONV followed by SILU can be fused where the vectorised kernel above runs, so that the SiLU grouping matches the SILU op
+bool ggml_compute_forward_ssm_conv_silu_fusable(const ggml_tensor * ssm_conv, const ggml_tensor * silu) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const ggml_tensor * src0 = ssm_conv->src[0];
+    const ggml_tensor * src1 = ssm_conv->src[1];
+    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ssm_conv->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(ssm_conv, silu) && ggml_is_contiguous(silu) &&
+           src1->nb[1] == (size_t) src1->ne[0]*sizeof(float) && ssm_conv->nb[0] == sizeof(float) && silu->nb[1] == silu->ne[0]*sizeof(float) &&
+           ssm_conv->ne[1] >= 16 && ssm_conv->ne[0] >= 16;
+#else
+    GGML_UNUSED(ssm_conv);
+    GGML_UNUSED(silu);
+    return false;
+#endif
+}
+
+void ggml_compute_forward_ssm_conv_silu_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * ssm_conv,
+        ggml_tensor * silu) {
+    ggml_compute_forward_ssm_conv_f32_impl(params, ssm_conv->src[0], ssm_conv->src[1], silu, true);
 }
 
 void ggml_compute_forward_ssm_conv(

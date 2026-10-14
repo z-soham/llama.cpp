@@ -3095,6 +3095,19 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    if (node->op == GGML_OP_SSM_CONV) {
+        // SSM_CONV + SILU fusion
+        const enum ggml_op fuse_ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+            struct ggml_tensor * silu_node = cgraph->nodes[node_n + 1];
+            if (ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU && silu_node->src[0] == node &&
+                ggml_compute_forward_ssm_conv_silu_fusable(node, silu_node)) {
+                ggml_compute_forward_ssm_conv_silu_fused(params, node, silu_node);
+                return 1;
+            }
+        }
+    }
+
     return 0;
 }
 
