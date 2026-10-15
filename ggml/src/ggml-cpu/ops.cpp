@@ -6,6 +6,7 @@
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
+#include "exp-flags.h"
 #include "vec.h"
 
 #include <algorithm>
@@ -767,6 +768,53 @@ void ggml_compute_forward_add_id(
             {
                 GGML_ABORT("unsupported type for ggml_compute_forward_add_id: %s", ggml_type_name(src0->type));
             }
+    }
+}
+
+// Fused chain of ADDs: nodes[i] = nodes[i-1] + nodes[i]->src[1]; only the last result is written.
+// Sums are accumulated left to right, so the result is bit-identical to the unfused chain.
+void ggml_compute_forward_add_chain_fused(
+        const ggml_compute_params * params,
+        ggml_tensor ** nodes,
+        int n_add) {
+
+    const ggml_tensor * first = nodes[0];
+    ggml_tensor * dst = nodes[n_add - 1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t nr  = ggml_nrows(dst);
+
+    // few rows (decode): split columns, aligned to 16 floats; otherwise split rows
+    const bool split_cols = nr < nth;
+    const int64_t dc = split_cols ? ((ne0/nth + 15)/16)*16 : ne0;
+    const int64_t c0 = split_cols ? MIN(dc*ith, ne0) : 0;
+    const int64_t c1 = split_cols ? MIN(c0 + dc, ne0) : ne0;
+
+    for (int64_t ir = split_cols ? 0 : ith; ir < nr; ir += split_cols ? 1 : nth) {
+        const int64_t i3 = ir/(dst->ne[2]*dst->ne[1]);
+        const int64_t i2 = (ir - i3*dst->ne[2]*dst->ne[1])/dst->ne[1];
+        const int64_t i1 = ir - i3*dst->ne[2]*dst->ne[1] - i2*dst->ne[1];
+
+        const float * p[16 + 1];
+        p[0] = (const float *) ((const char *) first->src[0]->data + i1*first->src[0]->nb[1] + i2*first->src[0]->nb[2] + i3*first->src[0]->nb[3]);
+        for (int k = 0; k < n_add; ++k) {
+            const ggml_tensor * s = nodes[k]->src[1];
+            p[k + 1] = (const float *) ((const char *) s->data + i1*s->nb[1] + i2*s->nb[2] + i3*s->nb[3]);
+        }
+        float * y = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int64_t cb = c0; cb < c1; cb += 256) {
+            const int64_t cn = MIN(256, c1 - cb);
+            float acc[256];
+            ggml_vec_add_f32(cn, acc, p[0] + cb, p[1] + cb);
+            for (int k = 2; k <= n_add; ++k) {
+                ggml_vec_add_f32(cn, acc, acc, p[k] + cb);
+            }
+            memcpy(y + cb, acc, cn*sizeof(float));
+        }
     }
 }
 
@@ -4157,6 +4205,60 @@ void ggml_compute_forward_rms_norm_mul_fused(
     }
 }
 
+// Fused ADD + RMS_NORM + MUL: dst_add = a + b (kept, it has other consumers), dst_mul = rms_norm(dst_add) * w.
+void ggml_compute_forward_add_rms_norm_mul_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_add,
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_mul) {
+
+    const ggml_tensor * a = dst_add->src[0];
+    const ggml_tensor * b = dst_add->src[1];
+    const ggml_tensor * w = (dst_mul->src[0] == dst_rms_norm) ? dst_mul->src[1] : dst_mul->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_are_same_shape(dst_add, dst_mul));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne00 = a->ne[0];
+    const int64_t ne01 = a->ne[1];
+    const int64_t ne02 = a->ne[2];
+    const int64_t ne03 = a->ne[3];
+
+    float eps;
+    memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * pa = (const float *) ((const char *) a->data + i01*a->nb[1] + i02*a->nb[2] + i03*a->nb[3]);
+                const float * pb = (const float *) ((const char *) b->data + i01*b->nb[1] + i02*b->nb[2] + i03*b->nb[3]);
+                float * x = (float *) ((char *) dst_add->data + i01*dst_add->nb[1] + i02*dst_add->nb[2] + i03*dst_add->nb[3]);
+
+                ggml_vec_add_f32(ne00, x, pa, pb);
+
+                ggml_float sum = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum += (ggml_float)(x[i00] * x[i00]);
+                }
+
+                const float mean  = sum/ne00;
+                const float scale = 1.0f/sqrtf(mean + eps);
+
+                const float * pw = (const float *) ((const char *) w->data + (i01 % w->ne[1])*w->nb[1] + (i02 % w->ne[2])*w->nb[2] + (i03 % w->ne[3])*w->nb[3]);
+                float * y = (float *) ((char *) dst_mul->data + i01*dst_mul->nb[1] + i02*dst_mul->nb[2] + i03*dst_mul->nb[3]);
+
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    y[i00] = x[i00] * scale * pw[i00];
+                }
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_rms_norm_back_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5292,6 +5394,29 @@ static void ggml_compute_forward_get_rows_f32(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    static const bool split_cols = ggml_cpu_exp_enabled("get_rows_cols");
+    if (split_cols && nr < nth && nc >= 16384) {
+        // few long rows: split the columns of each row across threads
+        const int64_t dc = ((nc/nth + 15)/16)*16;
+        const int64_t c0 = MIN(dc*ith, nc);
+        const int64_t c1 = MIN(c0 + dc, nc);
+        for (int64_t i = 0; i < nr; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+            GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+            if (c1 > c0) {
+                ggml_vec_cpy_f32(c1 - c0,
+                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + c0,
+                        (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + c0);
+            }
+        }
+        return;
+    }
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
