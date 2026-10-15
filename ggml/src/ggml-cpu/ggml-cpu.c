@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "tiled/tiled.h"
+#include "exp-flags.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -3063,6 +3064,46 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_exp_add_rms_mul = false; // GGML_CPU_EXP=add_rms_mul, same lifetime
+static bool ggml_cpu_exp_add_chain = false;   // GGML_CPU_EXP=add_chain, same lifetime
+static bool ggml_cpu_exp_stats = false;       // GGML_CPU_EXP=stats: print fused-node counters at exit
+static bool ggml_cpu_exp_serial = false;      // GGML_CPU_EXP=serial: run chains of tiny nodes on thread 0 without barriers
+static int64_t ggml_cpu_exp_cnt[3] = { 0, 0, 0 }; // barriers removed by add_rms_mul, add_chain, serial (thread 0 only)
+
+static void ggml_cpu_exp_print_stats(void) {
+    fprintf(stderr, "ggml_cpu_exp: nodes removed by fusion: add_rms_mul=%" PRId64 " add_chain=%" PRId64 " serial=%" PRId64 "\n",
+            ggml_cpu_exp_cnt[0], ggml_cpu_exp_cnt[1], ggml_cpu_exp_cnt[2]);
+}
+
+// The fusions below target decode (few rows); large batches keep the unfused path, which splits rows across threads with better locality.
+#define GGML_FUSE_SMALL_MAX_BYTES 65536
+
+// Fused kernels write whole rows per thread. That is only safe if dst does not partially overlap a source
+// (the graph allocator may place dst inside a dead source buffer); identical layout (in-place) is fine when allowed.
+static bool ggml_cpu_exp_alias_ok(const struct ggml_tensor * dst, const struct ggml_tensor * src, bool allow_same) {
+    uintptr_t d_lo = (uintptr_t) dst->data;
+    uintptr_t s_lo = (uintptr_t) src->data;
+    uintptr_t d_hi = d_lo + ggml_type_size(dst->type);
+    uintptr_t s_hi = s_lo + ggml_type_size(src->type);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        d_hi += (uintptr_t) (dst->ne[i] - 1) * dst->nb[i];
+        s_hi += (uintptr_t) (src->ne[i] - 1) * src->nb[i];
+    }
+    if (d_hi <= s_lo || s_hi <= d_lo) {
+        return true;
+    }
+    if (!allow_same || d_lo != s_lo) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (dst->ne[i] != src->ne[i] || dst->nb[i] != src->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#define GGML_ADD_CHAIN_MAX 16
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3075,6 +3116,78 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (ggml_cpu_exp_add_rms_mul && node->op == GGML_OP_ADD && node_n + 2 < cgraph->n_nodes) {
+        // ADD + RMS_NORM + MUL; the ADD result has other consumers and is still written
+        const enum ggml_op fuse_ops[] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const int outputs[] = { node_n, node_n + 2 };
+        if (ggml_can_fuse_subgraph(cgraph, node_n, 3, fuse_ops, outputs, 2)) {
+            struct ggml_tensor * rms_node = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 2];
+            const struct ggml_tensor * mul_w = (mul_node->src[0] == rms_node)
+                ? mul_node->src[1] : mul_node->src[0];
+            if (rms_node->src[0] == node &&
+                (mul_node->src[0] == rms_node || mul_node->src[1] == rms_node) &&
+                node->src[0]->type == GGML_TYPE_F32 &&
+                node->src[1]->type == GGML_TYPE_F32 &&
+                node->type         == GGML_TYPE_F32 &&
+                mul_node->type     == GGML_TYPE_F32 &&
+                mul_w->type        == GGML_TYPE_F32 &&
+                ggml_are_same_shape(node->src[0], node->src[1]) &&
+                node->src[0]->nb[0] == sizeof(float) &&
+                node->src[1]->nb[0] == sizeof(float) &&
+                node->nb[0]         == sizeof(float) &&
+                mul_w->ne[0]        == node->ne[0]   &&
+                mul_w->nb[0]        == sizeof(float) &&
+                ggml_nbytes(node)   <= GGML_FUSE_SMALL_MAX_BYTES &&
+                ggml_cpu_exp_alias_ok(node,     node->src[0], true)  &&
+                ggml_cpu_exp_alias_ok(node,     node->src[1], true)  &&
+                ggml_cpu_exp_alias_ok(mul_node, node->src[0], true)  &&
+                ggml_cpu_exp_alias_ok(mul_node, node->src[1], true)  &&
+                ggml_cpu_exp_alias_ok(mul_node, node,         false) &&
+                ggml_cpu_exp_alias_ok(mul_node, mul_w,        false)) {
+
+                ggml_compute_forward_add_rms_norm_mul_fused(params, node, rms_node, mul_node);
+                if (ggml_cpu_exp_stats && params->ith == 0) {
+                    ggml_cpu_exp_cnt[0] += 2;
+                }
+                return 2;
+            }
+        }
+    }
+
+    if (ggml_cpu_exp_add_chain && node->op == GGML_OP_ADD) {
+        // chain of ADDs, each consuming the previous result: ((s0 + s1) + s2) + ...
+        enum ggml_op add_ops[GGML_ADD_CHAIN_MAX];
+        int n_add = 0;
+        while (n_add < GGML_ADD_CHAIN_MAX && node_n + n_add < cgraph->n_nodes) {
+            const struct ggml_tensor * cur = cgraph->nodes[node_n + n_add];
+            if (cur->op != GGML_OP_ADD || cur->type != GGML_TYPE_F32 ||
+                cur->src[0]->type != GGML_TYPE_F32 || cur->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(cur->src[0], cur->src[1]) ||
+                cur->src[0]->nb[0] != sizeof(float) || cur->src[1]->nb[0] != sizeof(float) ||
+                cur->nb[0] != sizeof(float)) {
+                break;
+            }
+            if (n_add > 0 && cur->src[0] != cgraph->nodes[node_n + n_add - 1]) {
+                break;
+            }
+            add_ops[n_add++] = GGML_OP_ADD;
+        }
+        bool alias_ok = n_add >= 2;
+        for (int k = 0; alias_ok && k < n_add; k++) {
+            alias_ok = ggml_cpu_exp_alias_ok(cgraph->nodes[node_n + n_add - 1], cgraph->nodes[node_n + k]->src[1], true);
+        }
+        alias_ok = alias_ok && ggml_cpu_exp_alias_ok(cgraph->nodes[node_n + n_add - 1], node->src[0], true);
+        alias_ok = alias_ok && ggml_nbytes(cgraph->nodes[node_n + n_add - 1]) <= GGML_FUSE_SMALL_MAX_BYTES;
+        if (alias_ok && ggml_can_fuse(cgraph, node_n, add_ops, n_add)) {
+            ggml_compute_forward_add_chain_fused(params, cgraph->nodes + node_n, n_add);
+            if (ggml_cpu_exp_stats && params->ith == 0) {
+                ggml_cpu_exp_cnt[1] += n_add - 1;
+            }
+            return n_add - 1;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3109,6 +3222,63 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     return 0;
+}
+
+// Nodes whose work is tiny: a chain of them runs on thread 0 alone (kernels called with nth = 1), saving the barriers in between.
+#define GGML_SERIAL_MAX_BYTES 32768
+
+static bool ggml_cpu_serial_ok(const struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_RMS_NORM:
+            break;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(node)) {
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_SOFTPLUS:
+                case GGML_UNARY_OP_SILU:
+                    break;
+                default:
+                    return false;
+            }
+            break;
+        case GGML_OP_GLU:
+            if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) {
+                return false;
+            }
+            break;
+        default:
+            return false;
+    }
+    return ggml_nbytes(node) <= GGML_SERIAL_MAX_BYTES;
+}
+
+// Index of the last node of the serial chain starting at node_n, or node_n if it is not worth chaining.
+// Empty ops and nodes that are not computed are transparent. Same result on every thread.
+static int ggml_cpu_serial_chain_end(const struct ggml_cgraph * cgraph, int node_n, int * n_compute) {
+    int end = node_n;
+    int n   = 0;
+    for (int j = node_n; j < cgraph->n_nodes; j++) {
+        const struct ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_op_is_empty(nj->op) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (!ggml_cpu_serial_ok(nj)) {
+            break;
+        }
+        end = j;
+        n++;
+    }
+    *n_compute = n;
+    return n >= 2 ? end : node_n;
 }
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
@@ -3151,13 +3321,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-        if (n_fused > 0) {
-            node_n += n_fused;
+        int n_serial = 0;
+        const int serial_end = (ggml_cpu_exp_serial && !cplan->use_ref) ? ggml_cpu_serial_chain_end(cgraph, node_n, &n_serial) : node_n;
+        if (serial_end > node_n) {
+            if (state->ith == 0) {
+                struct ggml_compute_params params1 = params;
+                params1.nth = 1;
+                for (int j = node_n; j <= serial_end; j++) {
+                    struct ggml_tensor * nj = cgraph->nodes[j];
+                    if (ggml_op_is_empty(nj->op) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    const int nf = ggml_cpu_try_fuse_ops(cgraph, j, &params1, cplan);
+                    if (nf > 0) {
+                        j += nf;
+                        GGML_ASSERT(j <= serial_end);
+                    } else {
+                        ggml_compute_forward(&params1, nj);
+                    }
+                }
+                if (ggml_cpu_exp_stats) {
+                    ggml_cpu_exp_cnt[2] += n_serial - 1;
+                }
+            }
+            node_n = serial_end;
         } else {
-            ggml_compute_forward(&params, node);
+            // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+            // Try fused ops, fall back to normal compute
+            const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+            if (n_fused > 0) {
+                node_n += n_fused;
+            } else {
+                ggml_compute_forward(&params, node);
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3940,6 +4136,13 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            ggml_cpu_exp_add_rms_mul = ggml_cpu_exp_enabled("add_rms_mul");
+            ggml_cpu_exp_add_chain = ggml_cpu_exp_enabled("add_chain");
+            ggml_cpu_exp_stats = ggml_cpu_exp_enabled("stats");
+            ggml_cpu_exp_serial = ggml_cpu_exp_enabled("serial");
+            if (ggml_cpu_exp_stats) {
+                atexit(ggml_cpu_exp_print_stats);
+            }
         }
 
         is_first_call = false;
