@@ -251,7 +251,8 @@ static void ggml_zendnn_compute_forward_mul_mat(
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             const void* wdata = (src1->type == vec_dot_type || src0->type == GGML_TYPE_Q8_0) ? src1->data : work_data;
-            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            // Q8_0 keeps src1 as F32 (dynamic quantization), so rows are F32-sized here
+            const size_t row_size = src0->type == GGML_TYPE_Q8_0 ? ne10 * sizeof(float) : ggml_row_size(vec_dot_type, ne10);
             if (!ggml_zendnn_gemm(ctx,
                                   ne01,     // m
                                   ne11,     // n
