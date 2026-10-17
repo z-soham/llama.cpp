@@ -74,6 +74,15 @@ zendnnl::common::data_type_t ggml_to_zendnn_type() {
  * dtype selection plus, for Q8_0 weights, dynamic-quant setup. Callers still need to set
  * quant_params.src_scale.dims themselves, since that depends on the batch size(s) in use.
  */
+// experiment knobs (scratch worktree, not for upstream as is)
+// GGML_ZENDNN_WC_DENSE / GGML_ZENDNN_WC_MOE: per-call weight cache mode cap (0,1,2) for dense and expert matmuls (default: leave library default)
+// GGML_ZENDNN_SMALL_N_DENSE / GGML_ZENDNN_SMALL_N_MOE: 1 = let ZenDNN take BF16/F32 matmuls with few tokens (drop the N <= 128 rule) so that
+//   ZenDNN is the only reader of weights it has repacked in place
+static int ggml_zendnn_env_int(const char * name, int def) {
+    const char * v = std::getenv(name);
+    return v ? std::atoi(v) : def;
+}
+
 template <typename TA, typename TB, typename TC>
 static zendnnl::lowoha::matmul::matmul_params ggml_zendnn_make_matmul_params(ggml_backend_zendnn_context * ctx) {
     zendnnl::lowoha::matmul::matmul_params params;
@@ -110,6 +119,10 @@ static bool ggml_zendnn_matmul(ggml_backend_zendnn_context * ctx, int64_t m, int
                                int64_t ldc) {
 
     zendnnl::lowoha::matmul::matmul_params params = ggml_zendnn_make_matmul_params<TA, TB, TC>(ctx);
+    {
+        static const int wc_dense = ggml_zendnn_env_int("GGML_ZENDNN_WC_DENSE", -1);
+        if (wc_dense >= 0) { params.weight_cache_type = wc_dense; }
+    }
 
     zendnnl::lowoha::matmul::matmul_batch_params_t batch_params;
 
@@ -287,6 +300,10 @@ static bool ggml_zendnn_group_matmul(ggml_backend_zendnn_context * ctx, int64_t 
     const int n_experts = n.size();
 
     zendnnl::lowoha::matmul::matmul_params base_params = ggml_zendnn_make_matmul_params<TA, TB, TC>(ctx);
+    {
+        static const int wc_moe = ggml_zendnn_env_int("GGML_ZENDNN_WC_MOE", -1);
+        if (wc_moe >= 0) { base_params.weight_cache_type = wc_moe; }
+    }
 
     ggml_zendnn_moe_scratch & sc = ctx->moe;
     sc.layout.assign(n_experts, 'r');
@@ -777,7 +794,10 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
                 const int64_t K = inputs->ne[0];
                 const int64_t N = (inputs->ne[1]*inputs->ne[2]*inputs->ne[3]);
                 const int64_t M = weights->ne[1];
-                if(K <= 256 || N <= 128 || M <= 96) {
+                static const bool small_n_dense = ggml_zendnn_env_int("GGML_ZENDNN_SMALL_N_DENSE", 0) != 0;
+                static const bool small_n_moe   = ggml_zendnn_env_int("GGML_ZENDNN_SMALL_N_MOE", 0) != 0;
+                const bool small_n_ok = weights->type != GGML_TYPE_Q8_0 && (op->op == GGML_OP_MUL_MAT ? small_n_dense : small_n_moe);
+                if (K <= 256 || (!small_n_ok && N <= 128) || M <= 96) {
                     return false;
                 }
             }
